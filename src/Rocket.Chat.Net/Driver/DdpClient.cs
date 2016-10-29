@@ -2,122 +2,173 @@
 {
     using System;
     using System.Collections.Concurrent;
+    using System.Collections.Generic;
+    using System.Linq;
     using System.Threading;
     using System.Threading.Tasks;
 
     using Newtonsoft.Json;
+    using Newtonsoft.Json.Linq;
 
-    using Rocket.Chat.Net.Helpers;
     using Rocket.Chat.Net.Interfaces;
     using Rocket.Chat.Net.Models;
+    using Rocket.Chat.Net.Portability.Websockets;
 
-    using WebSocketSharp;
-
-    public class DdpClient : IDisposable
+    public class DdpClient : IDdpClient
     {
         private readonly ILogger _logger;
-        private readonly WebSocket _socket;
-        private readonly ConcurrentDictionary<string, dynamic> _messages = new ConcurrentDictionary<string, dynamic>();
+        private readonly IWebSocketWrapper _socket;
+        private readonly ConcurrentDictionary<string, JObject> _messages = new ConcurrentDictionary<string, JObject>();
 
         public string Url { get; }
         public string SessionId { get; private set; }
+        public bool IsDisposed { get; private set; }
 
         public event DataReceived DataReceivedRaw;
+        public event DdpReconnect DdpReconnect;
 
         public DdpClient(string baseUrl, bool useSsl, ILogger logger)
         {
             _logger = logger;
-            Url = (useSsl ? "wss://" : "ws://") + baseUrl + "/websocket";
 
-            _socket = new WebSocket(Url);
+            var protocol = useSsl ? "wss" : "ws";
+            Url = $"{protocol}://{baseUrl}/websocket";
+
+            _socket = new WebSocketWrapper(new PortableWebSocket(Url));
             AttachEvents();
-            _socket.Connect();
+        }
+
+        public DdpClient(IWebSocketWrapper socket, ILogger logger)
+        {
+            _logger = logger;
+
+            _socket = socket;
+            AttachEvents();
         }
 
         private void AttachEvents()
         {
-            _socket.OnMessage += SocketOnMessage;
-            _socket.OnClose += (sender, args) => _logger.Debug("CLOSE: " + args.Reason);
-            _socket.OnError += (sender, args) => _logger.Info("ERROR: " + args.Message);
-            _socket.OnOpen += (sender, args) => _logger.Debug("OPEN");
+            _socket.MessageReceived += SocketOnMessage;
+            _socket.Closed += SocketOnClosed;
+            _socket.Error += SocketOnError;
+            _socket.Opened += SocketOnOpened;
         }
 
-        private void SocketOnMessage(object sender, MessageEventArgs messageEventArgs)
+        private void SocketOnClosed(object sender, EventArgs eventArgs)
         {
-            var json = messageEventArgs.Data;
-            dynamic data = JsonConvert.DeserializeObject(json);
+            _logger.Debug("CLOSE");
+            if (SessionId != null && !IsDisposed)
+            {
+                ConnectAsync(CancellationToken.None).Wait();
+            }
+        }
+
+        private void SocketOnError(object sender, PortableErrorEventArgs errorEventArgs)
+        {
+            _logger.Info("ERROR: " + errorEventArgs?.Exception?.Message);
+        }
+
+        private void SocketOnOpened(object sender, EventArgs eventArgs)
+        {
+            _logger.Debug("OPEN");
+
+            _logger.Debug("Sending connection request");
+            const string ddpVersion = "1";
+            var request = new
+            {
+                msg = "connect",
+                version = ddpVersion,
+                session = SessionId, // Although, it doesn't appear that RC handles resuming sessions
+                support = new[]
+                {
+                    ddpVersion
+                }
+            };
+
+            SendObjectAsync(request, CancellationToken.None).Wait();
+        }
+
+        private void SocketOnMessage(object sender, PortableMessageReceivedEventArgs messageEventArgs)
+        {
+            var json = messageEventArgs.Message;
+            var data = JObject.Parse(json);
             _logger.Debug($"RECIEVED: {JsonConvert.SerializeObject(data, Formatting.Indented)}");
 
-            if (DriverHelper.HasProperty(data, "msg"))
+            var isRocketMessage = data?["msg"] != null;
+            if (isRocketMessage)
             {
-                string type = data.msg;
+                var type = data["msg"].ToObject<string>();
                 InternalHandle(type, data);
                 OnDataReceived(type, data);
             }
         }
 
-        private void InternalHandle(string type, dynamic data)
+        private void InternalHandle(string type, JObject data)
         {
-            if (DriverHelper.HasProperty(data, "id"))
+            if (data["id"] != null)
             {
-                string id = data.id;
+                var id = data["id"].ToObject<string>();
                 _messages.TryAdd(id, data);
             }
 
             switch (type)
             {
                 case "ping": // Required by spec
-                    Pong(data);
+                    PongAsync(data).Wait();
                     break;
                 case "connected":
-                    SessionId = data.session;
+
+                    if (SessionId != null)
+                    {
+                        OnDdpReconnect();
+                    }
+                    SessionId = data["session"].ToObject<string>();
+
                     _logger.Debug($"Connected via session {SessionId}.");
+                    break;
+                case "ready":
+                    var subs = data["subs"];
+                    var ids = subs?.ToObject<List<string>>();
+                    var id = ids?.FirstOrDefault(); // TODO Handle collection?
+                    if (id != null)
+                    {
+                        _messages.TryAdd(id, data);
+                    }
                     break;
             }
         }
 
-        public async Task<dynamic> Ping()
+        public async Task PingAsync(CancellationToken token)
         {
             var id = CreateId();
             var request = new
             {
-                msg = "ping", id
+                msg = "ping",
+                id
             };
 
-            await SendObject(request);
-
-            var result = await WaitForIdAsync(id);
-
-            return result;
+            await SendObjectAsync(request, token).ConfigureAwait(false);
+            await WaitForIdOrReadyAsync(id, token).ConfigureAwait(false);
         }
 
-        private async Task Pong(dynamic data)
+        private async Task PongAsync(JObject data)
         {
             var request = new
             {
-                msg = "pong", data.id
+                msg = "pong",
+                id = data["id"]?.ToObject<string>()
             };
 
-            await SendObject(request);
+            await SendObjectAsync(request, CancellationToken.None).ConfigureAwait(false);
         }
 
-        public async Task ConnectAsync(string ddpVersion = "pre1")
+        public async Task ConnectAsync(CancellationToken token)
         {
-            var request = new
-            {
-                msg = "connect",
-                version = ddpVersion,
-                support = new[]
-                {
-                   ddpVersion
-                }
-            };
-
-            await SendObject(request);
-            await WaitForConnect();
+            _socket.Open();
+            await WaitForConnectAsync(token).ConfigureAwait(false);
         }
 
-        public async Task<string> SubscribeAsync(string name, params dynamic[] args)
+        public async Task<string> SubscribeAsync(string name, CancellationToken token, params object[] args)
         {
             var id = CreateId();
             var request = new
@@ -128,11 +179,39 @@
                 id
             };
 
-            await SendObject(request);
+            await SendObjectAsync(request, token).ConfigureAwait(false);
             return id;
         }
 
-        public async Task<dynamic> CallAsync(string method, params object[] args)
+        public async Task<string> SubscribeAndWaitAsync(string name, CancellationToken token, params object[] args)
+        {
+            var id = CreateId();
+            var request = new
+            {
+                msg = "sub",
+                @params = args,
+                name,
+                id
+            };
+
+            await SendObjectAsync(request, token).ConfigureAwait(false);
+            await WaitForIdOrReadyAsync(id, token).ConfigureAwait(false);
+            return id;
+        }
+
+        public async Task UnsubscribeAsync(string id, CancellationToken token)
+        {
+            var request = new
+            {
+                msg = "unsub",
+                id
+            };
+
+            await SendObjectAsync(request, token).ConfigureAwait(false);
+            await WaitForIdOrReadyAsync(id, token).ConfigureAwait(false);
+        }
+
+        public async Task<JObject> CallAsync(string method, CancellationToken token, params object[] args)
         {
             var id = CreateId();
             var request = new
@@ -143,63 +222,62 @@
                 id
             };
 
-            await SendObject(request);
-            var result = await WaitForIdAsync(id);
+            await SendObjectAsync(request, token).ConfigureAwait(false);
+            var result = await WaitForIdOrReadyAsync(id, token).ConfigureAwait(false);
 
             return result;
         }
 
-        private void OnDataReceived(string type, dynamic data)
+        private void OnDataReceived(string type, JObject data)
         {
             DataReceivedRaw?.Invoke(type, data);
         }
 
         public void Dispose()
         {
+            IsDisposed = true;
+            SessionId = null;
             _socket.Close();
         }
 
-        private async Task SendObject(dynamic data)
+        private async Task SendObjectAsync(object payload, CancellationToken token)
         {
             await Task.Run(() =>
             {
-                var json = JsonConvert.SerializeObject(data, Formatting.Indented);
+                var json = JsonConvert.SerializeObject(payload, Formatting.Indented);
                 _logger.Debug($"SEND: {json}");
                 _socket.Send(json);
-            });
+            }, token).ConfigureAwait(false);
         }
 
-        private async Task<dynamic> WaitForIdAsync(string id)
+        private async Task<JObject> WaitForIdOrReadyAsync(string id, CancellationToken token)
         {
-            var task = Task.Run(() =>
+            JObject data;
+            while (!_messages.TryRemove(id, out data))
             {
-                while (!_messages.ContainsKey(id))
-                {
-                    Thread.Sleep(10);
-                }
-
-                dynamic data;
-                _messages.TryRemove(id, out data);
-                return data;
-            });
-
-            return await task;
+                token.ThrowIfCancellationRequested();
+                await Task.Delay(10, token).ConfigureAwait(false);
+            }
+            return data;
         }
 
-        private async Task WaitForConnect()
+        private async Task WaitForConnectAsync(CancellationToken token)
         {
-            await Task.Run(() =>
+            while (SessionId == null)
             {
-                while (SessionId == null)
-                {
-                    Thread.Sleep(10);
-                }
-            });
+                token.ThrowIfCancellationRequested();
+                await Task.Delay(10, token).ConfigureAwait(false);
+            }
         }
 
-        private string CreateId()
+        private static string CreateId()
         {
             return Guid.NewGuid().ToString("N");
+        }
+
+        private void OnDdpReconnect()
+        {
+            DdpReconnect?.Invoke();
         }
     }
 }

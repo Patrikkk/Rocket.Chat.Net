@@ -4,8 +4,10 @@
 
     using RestSharp;
 
-    using Rocket.Chat.Net.Helpers;
-    using Rocket.Chat.Net.Interfaces;
+    using Rocket.Chat.Net.Bot;
+    using Rocket.Chat.Net.Bot.Helpers;
+    using Rocket.Chat.Net.Bot.Interfaces;
+    using Rocket.Chat.Net.Bot.Models;
     using Rocket.Chat.Net.Models;
 
     internal class GiphyResponse : IBotResponse
@@ -15,18 +17,23 @@
         private const string Rating = "pg-13";
         private readonly RestClient _client = new RestClient("http://api.giphy.com/");
 
-        public GiphyResponse()
+        public bool CanRespond(ResponseContext context)
         {
+            var message = context.Message;
+            return message.Message.StartsWith(GiphyCommand) && !message.Message.Equals(GiphyCommand);
         }
 
-        public IEnumerable<BasicResponse> Response(RocketMessage message)
+        public IEnumerable<IMessageResponse> GetResponse(ResponseContext context, RocketChatBot caller)
         {
-            if (message.Message.StartsWith(GiphyCommand) && !message.Message.Equals(GiphyCommand))
+            var message = context.Message;
+
+            var search = message.Message.Replace(GiphyCommand, "").Trim();
+            var url = GetGiphy(search);
+            var attachment = new Attachment
             {
-                var search = message.Message.Replace(GiphyCommand, "").Trim();
-                var url = GetGiphy(search);
-                yield return message.CreateBasicReply(url);
-            }
+                ImageUrl = url
+            };
+            yield return message.CreateAttachmentReply(attachment);
         }
 
         private string GetGiphy(string search)
@@ -38,7 +45,7 @@
 
             var response = _client.Execute<dynamic>(request);
 
-            var url = response.Data["data"]["images"]["fixed_height"]["url"];//.images.fixed_height.url;
+            var url = response.Data["data"]["images"]["fixed_height"]["url"];
 
             return url;
         }
